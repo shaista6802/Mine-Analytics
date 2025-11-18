@@ -1,0 +1,10 @@
+streamlit
+geopandas
+rasterio
+shapely
+ezdxf
+pandas
+numpy
+fiona
+pyproj
+openpyxl
