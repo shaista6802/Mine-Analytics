@@ -6,15 +6,11 @@ from shapely.geometry import LineString
 import ezdxf
 import pandas as pd
 import tempfile
+import zipfile
 import os
 from io import BytesIO
 
-# Set page configuration
-st.set_page_config(
-    page_title="Haul Road Gradient Analysis",
-    page_icon="🛣️",
-    layout="wide"
-)
+st.set_page_config(page_title="Haul Road Gradient Analysis", page_icon="🛣️", layout="wide")
 
 # --- Core Functions ---
 def get_elevation(point, dtm):
@@ -59,11 +55,9 @@ def process_shapefile(shapefile_path):
     gdf = gpd.read_file(shapefile_path)
     return gdf, [geom for geom in gdf.geometry if isinstance(geom, LineString)]
 
-def process_haul_road(shapefile_path, dtm_path, segment_length, attribute_field=None):
+def process_haul_road(shapefile_path, dtm_path, segment_length):
     gdf, lines = process_shapefile(shapefile_path)
-    total_length = 0
-    green_length = 0
-    red_length = 0
+    total_length = green_length = red_length = 0
     detailed_results = []
 
     with rasterio.open(dtm_path) as dtm:
@@ -72,10 +66,6 @@ def process_haul_road(shapefile_path, dtm_path, segment_length, attribute_field=
 
         for idx, line in enumerate(lines):
             points, slopes = calculate_slope_fraction(line, dtm, segment_length)
-            attr_value = None
-            if attribute_field and attribute_field in gdf.columns:
-                attr_value = gdf.iloc[idx][attribute_field]
-
             for i in range(len(points) - 1):
                 segment = LineString([points[i], points[i+1]])
                 slope_ratio = slopes[i]
@@ -91,16 +81,14 @@ def process_haul_road(shapefile_path, dtm_path, segment_length, attribute_field=
 
                 detailed_results.append({
                     'Segment': f"{idx+1}-{i+1}",
-                    'Attribute': attr_value if attr_value else 'N/A',
                     'Length (m)': round(segment_length_meters, 2),
                     'Slope Ratio': round(slope_ratio, 4),
                     'Slope Fraction': slope_to_fraction(slope_ratio),
                     'Status': status
                 })
 
-                # Add DXF elements
-                points_coords = list(segment.coords)
-                msp.add_lwpolyline(points_coords, dxfattribs={'color': color})
+                # DXF elements
+                msp.add_lwpolyline(list(segment.coords), dxfattribs={'color': color})
                 buffer_polygon = segment.buffer(5, cap_style='flat')
                 hatch = msp.add_hatch(color=color)
                 hatch.paths.add_polyline_path(buffer_polygon.exterior.coords)
@@ -119,115 +107,61 @@ def process_haul_road(shapefile_path, dtm_path, segment_length, attribute_field=
 
     summary_data = {
         'Category': ['Total Length', 'Green (Acceptable)', 'Red (Steep)'],
-        'Length (meters)': [
-            round(total_length, 2),
-            round(green_length, 2),
-            round(red_length, 2)
-        ],
+        'Length (meters)': [round(total_length, 2), round(green_length, 2), round(red_length, 2)],
         'Percentage': [
             100.0,
             round((green_length/total_length)*100, 2) if total_length > 0 else 0,
             round((red_length/total_length)*100, 2) if total_length > 0 else 0
         ]
     }
-    summary_df = pd.DataFrame(summary_data)
-    detailed_df = pd.DataFrame(detailed_results)
-    return dxf_buffer, summary_df, detailed_df
+    return dxf_buffer, pd.DataFrame(summary_data), pd.DataFrame(detailed_results)
 
 # --- Streamlit UI ---
 st.title("🛣️ Haul Road Gradient Analysis")
 st.markdown("---")
 
-# Sidebar inputs
-st.sidebar.header("Input Parameters")
+# Upload shapefile ZIP
+shapefile_zip = st.file_uploader("Upload Shapefile ZIP (.zip)", type=["zip"])
+dtm_path = st.text_input("Enter Local DTM File Path (.tif)", value=r"D:\Haul Road\DTM\your_large_dtm.tif")
+segment_length = st.number_input("Segment Length (meters)", min_value=1, value=25)
 
-uploaded_shapefile = st.sidebar.file_uploader("Upload Shapefile (.shp)", type=['shp'])
-uploaded_shx = st.sidebar.file_uploader("Upload .shx file", type=['shx'])
-uploaded_dbf = st.sidebar.file_uploader("Upload .dbf file", type=['dbf'])
-uploaded_prj = st.sidebar.file_uploader("Upload .prj file (optional)", type=['prj'])
-
-# Local DTM path input
-dtm_path = st.sidebar.text_input(
-    "Enter Local DTM File Path (.tif)",
-    value=r"D:\Haul Road\DTM\your_large_dtm.tif",
-    help="Provide the full path to the DTM file on the server or local machine."
-)
-
-segment_length = st.sidebar.number_input("Sampling Interval (meters)", min_value=1, max_value=100, value=25, step=1)
-
-attribute_field = None
-if uploaded_shapefile and uploaded_shx and uploaded_dbf:
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            shp_path = os.path.join(tmpdir, "input.shp")
-            shx_path = os.path.join(tmpdir, "input.shx")
-            dbf_path = os.path.join(tmpdir, "input.dbf")
-            with open(shp_path, 'wb') as f:
-                f.write(uploaded_shapefile.read())
-            with open(shx_path, 'wb') as f:
-                f.write(uploaded_shx.read())
-            with open(dbf_path, 'wb') as f:
-                f.write(uploaded_dbf.read())
-            if uploaded_prj:
-                prj_path = os.path.join(tmpdir, "input.prj")
-                with open(prj_path, 'wb') as f:
-                    f.write(uploaded_prj.read())
-            gdf = gpd.read_file(shp_path)
-            attribute_fields = ['None'] + list(gdf.columns[gdf.columns != 'geometry'])
-            attribute_field = st.sidebar.selectbox("Attribute Field (optional)", options=attribute_fields)
-            if attribute_field == 'None':
-                attribute_field = None
-    except Exception as e:
-        st.sidebar.warning(f"Could not read shapefile attributes: {str(e)}")
-
-st.sidebar.markdown("---")
-analyze_button = st.sidebar.button("🚀 Run Analysis", type="primary")
-
-# Analysis
-if analyze_button:
-    if not all([uploaded_shapefile, uploaded_shx, uploaded_dbf]) or not dtm_path:
-        st.error("⚠️ Please upload shapefile components and enter DTM path!")
+if st.button("🚀 Run Analysis"):
+    if not shapefile_zip or not dtm_path:
+        st.error("Please upload shapefile ZIP and enter DTM path!")
     else:
         try:
-            with st.spinner("Processing haul road gradient analysis..."):
+            with st.spinner("Processing..."):
                 with tempfile.TemporaryDirectory() as tmpdir:
-                    shp_path = os.path.join(tmpdir, "input.shp")
-                    shx_path = os.path.join(tmpdir, "input.shx")
-                    dbf_path = os.path.join(tmpdir, "input.dbf")
-                    with open(shp_path, 'wb') as f:
-                        f.write(uploaded_shapefile.read())
-                    with open(shx_path, 'wb') as f:
-                        f.write(uploaded_shx.read())
-                    with open(dbf_path, 'wb') as f:
-                        f.write(uploaded_dbf.read())
-                    if uploaded_prj:
-                        prj_path = os.path.join(tmpdir, "input.prj")
-                        with open(prj_path, 'wb') as f:
-                            f.write(uploaded_prj.read())
+                    # Extract ZIP
+                    zip_path = os.path.join(tmpdir, "shapefile.zip")
+                    with open(zip_path, "wb") as f:
+                        f.write(shapefile_zip.read())
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(tmpdir)
 
-                    dxf_buffer, summary_df, detailed_df = process_haul_road(shp_path, dtm_path, segment_length, attribute_field)
+                    # Find .shp file
+                    shp_files = [f for f in os.listdir(tmpdir) if f.endswith(".shp")]
+                    if not shp_files:
+                        st.error("No .shp file found in ZIP!")
+                    else:
+                        shp_path = os.path.join(tmpdir, shp_files[0])
+                        dxf_buffer, summary_df, detailed_df = process_haul_road(shp_path, dtm_path, segment_length)
 
-                    st.success("✅ Analysis completed successfully!")
-                    st.subheader("📊 Summary Results")
-                    st.dataframe(summary_df, width='stretch', hide_index=True)
+                        st.success("✅ Analysis completed!")
+                        st.subheader("📊 Summary")
+                        st.dataframe(summary_df)
+                        st.subheader("📋 Detailed Analysis")
+                        st.dataframe(detailed_df)
 
-                    st.subheader("📋 Detailed Segment Analysis")
-                    st.dataframe(detailed_df, width='stretch', hide_index=True)
-
-                    st.subheader("⬇️ Download Results")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
                         st.download_button("📥 Download DXF", data=dxf_buffer, file_name="haul_road_gradient.dxf", mime="application/dxf")
-                    with col2:
-                        summary_excel = BytesIO()
-                        summary_df.to_excel(summary_excel, index=False, sheet_name='Summary')
-                        summary_excel.seek(0)
-                        st.download_button("📥 Download Summary (Excel)", data=summary_excel, file_name="haul_road_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                    with col3:
-                        detailed_excel = BytesIO()
-                        detailed_df.to_excel(detailed_excel, index=False, sheet_name='Detailed Analysis')
-                        detailed_excel.seek(0)
-                        st.download_button("📥 Download Detailed (Excel)", data=detailed_excel, file_name="haul_road_detailed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        excel_summary = BytesIO()
+                        summary_df.to_excel(excel_summary, index=False)
+                        excel_summary.seek(0)
+                        st.download_button("📥 Download Summary (Excel)", data=excel_summary, file_name="summary.xlsx")
+                        excel_detailed = BytesIO()
+                        detailed_df.to_excel(excel_detailed, index=False)
+                        excel_detailed.seek(0)
+                        st.download_button("📥 Download Detailed (Excel)", data=excel_detailed, file_name="detailed.xlsx")
         except Exception as e:
-            st.error(f"❌ Error during analysis: {str(e)}")
+            st.error(f"❌ Error: {str(e)}")
             st.exception(e)
